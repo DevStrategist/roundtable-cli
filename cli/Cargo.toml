@@ -1,6 +1,6 @@
 [package]
 name = "roundtable-cli"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 publish = false
 
@@ -27,6 +27,7 @@ sysinfo = "0.38"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 ctrlc = { version = "3", features = ["termination"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 [profile.release]
 lto = "thin"

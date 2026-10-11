@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::{
+    fs::{FileTypeExt, MetadataExt},
+    net::UnixStream,
+};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -100,36 +104,126 @@ impl Drop for JsonProcess {
     }
 }
 
+enum RpcTransport {
+    Process(JsonProcess),
+    Socket(Box<tungstenite::WebSocket<UnixStream>>),
+}
+impl RpcTransport {
+    fn send(&mut self, value: &Value) -> Result<()> {
+        match self {
+            Self::Process(process) => process.send(value),
+            Self::Socket(socket) => {
+                socket.get_mut().set_nonblocking(false)?;
+                socket
+                    .get_mut()
+                    .set_write_timeout(Some(Duration::from_secs(3)))?;
+                socket.send(tungstenite::Message::Text(value.to_string().into()))?;
+                Ok(())
+            }
+        }
+    }
+    fn receive(&mut self, timeout: Option<Duration>) -> Result<Option<Value>> {
+        match self {
+            Self::Process(process) => match timeout {
+                Some(wait) => match process.output.recv_timeout(wait) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                    Err(_) => bail!("Provider connection closed"),
+                },
+                None => Ok(process.output.try_recv().ok()),
+            },
+            Self::Socket(socket) => {
+                socket.get_mut().set_nonblocking(timeout.is_none())?;
+                if let Some(wait) = timeout {
+                    socket
+                        .get_mut()
+                        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+                }
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(text)) => Ok(Some(serde_json::from_str(&text)?)),
+                    Ok(tungstenite::Message::Close(_)) => bail!("Shared Codex connection closed"),
+                    Ok(_) => Ok(None),
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+        }
+    }
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Process(p) => Some(p.child.id()),
+            Self::Socket(_) => None,
+        }
+    }
+    fn exited(&mut self) -> Result<bool> {
+        match self {
+            Self::Process(p) => Ok(p.child.try_wait()?.is_some()),
+            Self::Socket(_) => Ok(false),
+        }
+    }
+}
 struct Rpc {
-    process: JsonProcess,
+    transport: RpcTransport,
     serial: u64,
     notifications: VecDeque<Value>,
     streamed_items: HashSet<String>,
 }
 impl Rpc {
     fn new(command: &mut Command) -> Result<Self> {
+        Self::initialize(RpcTransport::Process(JsonProcess::spawn(command)?))
+    }
+    fn shared(path: &Path) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.file_type().is_socket()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o022 != 0
+        {
+            bail!("Shared Codex socket must be owned by this user and not writable by others");
+        }
+        let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(4_000_000))
+            .max_frame_size(Some(4_000_000));
+        let (socket, _) =
+            tungstenite::client::client_with_config("ws://localhost/", stream, Some(config))?;
+        Self::initialize(RpcTransport::Socket(Box::new(socket)))
+    }
+    fn initialize(transport: RpcTransport) -> Result<Self> {
         let mut rpc = Self {
-            process: JsonProcess::spawn(command)?,
+            transport,
             serial: 0,
             notifications: VecDeque::new(),
             streamed_items: HashSet::new(),
         };
         rpc.call("initialize",json!({"clientInfo":{"name":"roundtable","title":"Roundtable","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
-        rpc.process.send(&json!({"method":"initialized"}))?;
+        rpc.transport.send(&json!({"method":"initialized"}))?;
         Ok(rpc)
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.serial += 1;
         let id = self.serial;
-        self.process
+        self.transport
             .send(&json!({"id":id,"method":method,"params":params}))?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let value = self
-                .process
-                .output
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .context("Provider response timed out; delivery may be uncertain")?;
+            if Instant::now() >= deadline {
+                bail!("Provider response timed out; delivery may be uncertain");
+            }
+            let Some(value) = self
+                .transport
+                .receive(Some(deadline.saturating_duration_since(Instant::now())))?
+            else {
+                continue;
+            };
             if value["id"] == id {
                 if value.get("error").is_some() {
                     bail!("Provider rejected this operation");
@@ -139,7 +233,7 @@ impl Rpc {
             if value.get("method").is_some() {
                 // No approval is granted implicitly. Managed sessions deny approval-required work.
                 if value.get("id").is_some() {
-                    self.process.send(&json!({"id":value["id"],"error":{"code":-32601,"message":"Roundtable does not approve provider permission requests"}}))?;
+                    self.transport.send(&json!({"id":value["id"],"error":{"code":-32601,"message":"Roundtable does not approve provider permission requests"}}))?;
                 } else {
                     if self.notifications.len() >= 1000 {
                         self.notifications.pop_front();
@@ -152,9 +246,9 @@ impl Rpc {
     fn drain(&mut self) -> Vec<Value> {
         let mut result: Vec<_> = self.notifications.drain(..).collect();
         for _ in 0..500 {
-            match self.process.output.try_recv() {
-                Ok(v) => result.push(v),
-                Err(_) => break,
+            match self.transport.receive(None) {
+                Ok(Some(v)) => result.push(v),
+                _ => break,
             }
         }
         result
@@ -204,7 +298,7 @@ impl Providers {
                     .filter(|s| valid_id(s))
                     .context("Provider did not return a session ID")?;
                 let mut s = Session::new("codex", id, &project, "managed");
-                s.pid = Some(rpc.process.child.id());
+                s.pid = rpc.transport.pid();
                 s.capabilities = vec!["prompt".into(), "steer".into(), "interrupt".into()];
                 (s, Managed::Codex(rpc))
             }
@@ -249,8 +343,12 @@ impl Providers {
     pub fn inventory(&mut self, state: &State) -> Result<()> {
         if self.proxy.is_none() && self.last_proxy_attempt.elapsed() > Duration::from_secs(30) {
             self.last_proxy_attempt = Instant::now();
-            // `proxy` only connects to an existing daemon. It never launches a coding turn.
-            self.proxy = Rpc::new(Command::new("codex").args(["app-server", "proxy"])).ok();
+            // The control socket carries WebSocket frames, not the stdio JSONL transport.
+            // Connect only to the existing same-user daemon; never resume its threads.
+            self.proxy = Rpc::shared(
+                &crate::discovery::home("codex").join("app-server-control/app-server-control.sock"),
+            )
+            .ok();
         }
         let mut loaded = vec![];
         if let Some(proxy) = self.proxy.as_mut() {
@@ -360,7 +458,7 @@ impl Providers {
                     for value in rpc.drain() {
                         codex_event(state, &mut session, &value, &mut rpc.streamed_items)?;
                     }
-                    if rpc.process.child.try_wait()?.is_some() {
+                    if rpc.transport.exited()? {
                         exited.push(id.clone());
                     }
                 }
@@ -671,12 +769,69 @@ fn codex_event(
 mod tests {
     use super::*;
     #[test]
+    fn shared_daemon_uses_websocket_frames_and_preserves_notifications() -> Result<()> {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("control.sock");
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))?;
+        assert!(Rpc::shared(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let init: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(init["method"], "initialize");
+            socket
+                .send(tungstenite::Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+            let initialized: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            let request: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            socket
+                .send(tungstenite::Message::Ping(vec![1, 2].into()))
+                .unwrap();
+            socket
+                .send(tungstenite::Message::Text(
+                    json!({"method":"turn/started","params":{"threadId":"existing"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            socket
+                .send(tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":{"data":["existing"]}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+        });
+        let mut rpc = Rpc::shared(&path)?;
+        assert_eq!(
+            rpc.call("thread/loaded/list", json!({}))?["data"][0],
+            "existing"
+        );
+        assert_eq!(rpc.drain()[0]["method"], "turn/started");
+        server.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
     fn existing_session_history_is_deduplicated_across_restarts() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let state = State::open(tmp.path().join("state"))?;
         state.set(
             "policy",
-            &json!({"content_roots":[std::fs::canonicalize(tmp.path())?],"remote_control":false}).to_string(),
+            &json!({"content_roots":[std::fs::canonicalize(tmp.path())?],"remote_control":false})
+                .to_string(),
         )?;
         let mut session = Session::new(
             "codex",
