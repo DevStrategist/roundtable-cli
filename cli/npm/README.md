@@ -80,3 +80,5 @@ no open-source license grant has been added (package license: UNLICENSED).
 
 Runtime and control require a matching Roundtable server. Supported external sessions expose
 capabilities individually; ordinary existing Claude terminals remain observation-only.
+
+[Verified flows and platform limits](https://github.com/DevStrategist/roundtable-cli/blob/main/VERIFICATION.md).
