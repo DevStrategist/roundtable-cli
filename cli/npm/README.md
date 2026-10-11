@@ -2,11 +2,11 @@
 
 Connect a Mac or Linux machine to Roundtable and supervise Codex and Claude Code sessions.
 The runtime is Rust. Node is only an npm launcher; background services run the native binary.
-Version 0.2.0 is prepared in source but not yet published. The login-only server is live;
-session monitoring/control requires deploying the matching server changes first.
+Install the npm tarball from the public GitHub release. No npm registry account is needed. The installer downloads a checksum-verified native
+binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.3/roundtable-cli-0.2.3.tgz
+npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.4/roundtable-cli-0.2.4.tgz
 roundtable login
 roundtable setup
 ```
@@ -53,7 +53,7 @@ roundtable monitor --metadata-only --deny-control
 roundtable logout
 ```
 
-On a headless Linux machine without Secret Service, `roundtable login --insecure-storage` stores
+When the OS credential store is unavailable (headless Linux or a locked macOS Keychain), `roundtable login --insecure-storage` stores
 the machine credential in a private 0600 file. On Linux without systemd, run `roundtable daemon`
 under your own supervisor. macOS uses a user LaunchAgent; Linux uses a systemd user service.
 Services start at login, not before login. Stopping the service ends Roundtable-managed provider
@@ -63,6 +63,7 @@ an upgraded service binary with `roundtable service install`.
 Telemetry syncs every two seconds, with five-second inventory reconciliation and bounded retry
 backoff. Offline activity is buffered locally. Overflow is reported as a coverage gap. Usage fields
 are cumulative provider reports; unavailable fields are null. No token-price estimate is invented.
+Interrupting managed Claude currently ends its process; start another session to continue.
 Claude input totals include uncached and cached tokens; cached input is a subset of input.
 The dashboard shows stale/offline data explicitly and excludes it from current session counts.
 
@@ -73,9 +74,9 @@ requires glibc 2.35+, Linux arm64 requires 2.39+. Musl/Alpine is not packaged. T
 cargo install --path cli --locked
 ```
 
-The npm scope must be configured by a maintainer before the first public release. CI produces
-tarballs for review; publishing is a separate, manually enabled workflow step.
-Configure each package's [npm trusted publisher](https://docs.npmjs.com/trusted-publishers/)
-for `DevStrategist/Roundtable`, workflow `cli-release.yml`, environment `npm-publish`.
-The workflow uses the [GitHub-hosted native runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
-for all four targets. Those builds must pass before enabling publication.
+Download native binaries without Node from [GitHub Releases](https://github.com/DevStrategist/roundtable-cli/releases).
+All four binaries and SHA256SUMS are built by the release workflow. The source is public;
+no open-source license grant has been added (package license: UNLICENSED).
+
+Runtime and control require a matching Roundtable server. Supported external sessions expose
+capabilities individually; ordinary existing Claude terminals remain observation-only.

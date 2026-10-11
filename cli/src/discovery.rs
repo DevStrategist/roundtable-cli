@@ -64,7 +64,7 @@ pub fn processes(system: &mut System) -> Vec<Process> {
         let args = p.cmd();
         let provider = if name == "codex" {
             Some("codex")
-        } else if name == "claude" {
+        } else if name == "claude" || name == "claude.exe" {
             Some("claude")
         } else if name == "node" {
             args.get(1).and_then(|s| {
@@ -511,6 +511,22 @@ pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovers_claudes_linux_native_executable_name() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let binary = tmp.path().join("claude.exe");
+        fs::copy("/bin/sleep", &binary)?;
+        let mut child = std::process::Command::new(binary).arg("5").spawn()?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let found = processes(&mut System::new())
+            .into_iter()
+            .any(|p| p.pid == child.id() && p.provider == "claude");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found);
+        Ok(())
+    }
     #[test]
     fn codex_visible_message_formats_deduplicate_without_collecting_reasoning() -> Result<()> {
         let tmp = tempfile::tempdir()?;
