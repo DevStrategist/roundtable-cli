@@ -1,6 +1,10 @@
 # Roundtable CLI
 
 Connect a Mac or Linux machine to Roundtable and supervise Codex and Claude Code sessions.
+
+Read the [complete CLI guide](https://roundtable.bot/docs/cli) for setup, machine naming,
+monitoring, assistant permissions, local commands, updates, and troubleshooting.
+
 The runtime is Rust. Node is only an npm launcher; background services run the native binary.
 Install the npm tarball from the public GitHub release. No npm registry account is needed. The installer downloads a checksum-verified native
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
