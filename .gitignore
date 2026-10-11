@@ -1,0 +1,9 @@
+cli/target/
+cli/artifacts/
+cli/dist/
+cli/tarballs/
+node_modules/
+*.tgz
+cli/npm/bin/native/
+.env*
+.secrets/

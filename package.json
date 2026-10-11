@@ -1,0 +1,38 @@
+{
+  "name": "@roundtable/cli",
+  "version": "0.2.0",
+  "description": "Native machine monitoring and coding-session control for Roundtable",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevStrategist/roundtable-cli.git"
+  },
+  "type": "module",
+  "bin": {
+    "roundtable": "cli/npm/bin/roundtable.mjs"
+  },
+  "files": [
+    "cli/npm/bin",
+    "cli/npm/scripts",
+    "cli/npm/package.json",
+    "README.md"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "postinstall": "node cli/npm/scripts/install.mjs",
+    "test": "node --test cli/tests/*.test.mjs"
+  }
+}
