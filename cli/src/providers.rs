@@ -676,7 +676,7 @@ mod tests {
         let state = State::open(tmp.path().join("state"))?;
         state.set(
             "policy",
-            &json!({"content_roots":[tmp.path()],"remote_control":false}).to_string(),
+            &json!({"content_roots":[std::fs::canonicalize(tmp.path())?],"remote_control":false}).to_string(),
         )?;
         let mut session = Session::new(
             "codex",

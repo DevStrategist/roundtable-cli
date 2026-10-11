@@ -500,7 +500,7 @@ mod tests {
         assert!(!state.session("codex:sample")?.live);
         state.set(
             "policy",
-            &json!({"content_roots":["/tmp"],"remote_control":false}).to_string(),
+            &json!({"content_roots":[fs::canonicalize("/tmp")?],"remote_control":false}).to_string(),
         )?;
         tail(&state, &path, "codex", &[])?;
         assert_eq!(

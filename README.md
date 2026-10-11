@@ -6,7 +6,7 @@ Install from the public GitHub release. The installer downloads a checksum-verif
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-npm install -g github:DevStrategist/roundtable-cli#v0.2.0
+npm install -g github:DevStrategist/roundtable-cli#v0.2.1
 roundtable login
 roundtable setup
 ```
