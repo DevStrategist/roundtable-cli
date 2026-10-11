@@ -44,6 +44,7 @@ pub fn processes(system: &mut System) -> Vec<Process> {
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always)
             .with_user(UpdateKind::Always),

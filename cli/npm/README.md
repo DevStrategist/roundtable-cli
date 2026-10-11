@@ -6,7 +6,7 @@ Version 0.2.0 is prepared in source but not yet published. The login-only server
 session monitoring/control requires deploying the matching server changes first.
 
 ```sh
-npm install -g @roundtable/cli
+npm install -g --install-links --allow-scripts=@roundtable/cli github:DevStrategist/roundtable-cli#v0.2.2
 roundtable login
 roundtable setup
 ```
