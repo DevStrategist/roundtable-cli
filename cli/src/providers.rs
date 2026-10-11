@@ -188,14 +188,31 @@ impl Rpc {
         Self::initialize(RpcTransport::Process(JsonProcess::spawn(command)?))
     }
     fn shared(path: &Path) -> Result<Self> {
-        let meta = std::fs::symlink_metadata(path).context("Inspect shared socket")?;
-        if !meta.file_type().is_socket()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o022 != 0
+        let owner = unsafe { libc::geteuid() };
+        let link = std::fs::symlink_metadata(path).context("Inspect shared socket")?;
+        let parent = std::fs::metadata(path.parent().context("Shared socket has no parent")?)?;
+        if link.uid() != owner
+            || !parent.is_dir()
+            || parent.uid() != owner
+            || parent.mode() & 0o077 != 0
         {
-            bail!("Shared Codex socket must be owned by this user and not writable by others");
+            bail!("Shared Codex socket must be in a private directory owned by this user");
         }
-        let stream = UnixStream::connect(path).context("Connect shared socket")?;
+        // Codex publishes a symlink to a short socket path under its private runtime directory.
+        // Connect to the validated canonical target, not through a mutable symlink again.
+        let target = std::fs::canonicalize(path).context("Resolve shared socket")?;
+        let meta = std::fs::symlink_metadata(&target)?;
+        let parent = std::fs::metadata(target.parent().context("Shared target has no parent")?)?;
+        if !meta.file_type().is_socket()
+            || meta.uid() != owner
+            || meta.mode() & 0o022 != 0
+            || !parent.is_dir()
+            || parent.uid() != owner
+            || parent.mode() & 0o077 != 0
+        {
+            bail!("Shared Codex socket target must be private and owned by this user");
+        }
+        let stream = UnixStream::connect(&target).context("Connect shared socket")?;
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .context("Set shared read timeout")?;
@@ -785,8 +802,14 @@ mod tests {
     fn shared_daemon_uses_websocket_frames_and_preserves_notifications() -> Result<()> {
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
         let tmp = tempfile::tempdir_in("/tmp")?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))?;
         let path = tmp.path().join("control.sock");
         let listener = UnixListener::bind(&path).context("Bind test socket")?;
+        let link_dir = tmp.path().join("control");
+        std::fs::create_dir(&link_dir)?;
+        std::fs::set_permissions(&link_dir, std::fs::Permissions::from_mode(0o700))?;
+        let link = link_dir.join("published.sock");
+        std::os::unix::fs::symlink(&path, &link)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
             .context("Make test socket shared")?;
         assert!(Rpc::shared(&path).is_err());
@@ -831,7 +854,10 @@ mod tests {
                 .unwrap();
             finish.recv_timeout(Duration::from_secs(3)).unwrap();
         });
-        let mut rpc = Rpc::shared(&path)?;
+        std::fs::set_permissions(&link_dir, std::fs::Permissions::from_mode(0o777))?;
+        assert!(Rpc::shared(&link).is_err());
+        std::fs::set_permissions(&link_dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut rpc = Rpc::shared(&link)?;
         assert_eq!(
             rpc.call("thread/loaded/list", json!({}))?["data"][0],
             "existing"

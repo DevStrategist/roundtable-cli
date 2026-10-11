@@ -6,7 +6,7 @@ Install the npm tarball from the public GitHub release. No npm registry account 
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.6/roundtable-cli-0.2.6.tgz
+npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.7/roundtable-cli-0.2.7.tgz
 roundtable login
 roundtable setup
 ```

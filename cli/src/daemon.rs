@@ -25,7 +25,11 @@ use std::time::{Duration, Instant};
 pub fn request(root: &Path, value: &Value) -> Result<Value> {
     let mut stream = UnixStream::connect(root.join("agent.sock"))
         .context("Service is not running. Run roundtable daemon or roundtable service start")?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(if value["op"] == "start" {
+        45
+    } else {
+        15
+    })))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     serde_json::to_writer(&mut stream, value)?;
     stream.write_all(b"\n")?;
@@ -381,18 +385,8 @@ pub fn run(root: PathBuf, config: PathBuf, server: Url) -> Result<()> {
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-                let result = (|| -> Result<Value> {
-                    let mut line = String::new();
-                    BufReader::new(stream.try_clone()?)
-                        .take(100000)
-                        .read_line(&mut line)?;
-                    if line.len() >= 100000 {
-                        bail!("Local request is too large");
-                    }
-                    handle(&state, &mut providers, serde_json::from_str(&line)?)
-                })();
+                let result = read_request(&mut stream)
+                    .and_then(|value| handle(&state, &mut providers, value));
                 let value = match result {
                     Ok(v) => v,
                     Err(e) => json!({"error":e.to_string()}),
@@ -410,4 +404,42 @@ pub fn run(root: PathBuf, config: PathBuf, server: Url) -> Result<()> {
     let _ = worker.join();
     let _ = fs::remove_file(socket);
     Ok(())
+}
+
+fn read_request(stream: &mut UnixStream) -> Result<Value> {
+    // BSD accept inherits O_NONBLOCK from the listener. Requests can arrive in fragments.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut line = String::new();
+    BufReader::new(stream.try_clone()?)
+        .take(100000)
+        .read_line(&mut line)?;
+    if line.len() >= 100000 {
+        bail!("Local request is too large");
+    }
+    Ok(serde_json::from_str(&line)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn local_socket_accepts_delayed_fragmented_requests() -> Result<()> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let mut client = UnixStream::connect(&path)?;
+        let (mut server, _) = listener.accept()?;
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            std::thread::sleep(Duration::from_millis(30));
+            client.write_all(b"{\"op\":")?;
+            std::thread::sleep(Duration::from_millis(30));
+            client.write_all(b"\"status\"}\n")
+        });
+        assert_eq!(read_request(&mut server)?, json!({"op":"status"}));
+        writer.join().unwrap()?;
+        Ok(())
+    }
 }
