@@ -46,9 +46,13 @@ jobs:
         with:
           path: release
           merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm pack --ignore-scripts --pack-destination release
       - run: |
           cd release
-          sha256sum *.gz > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" *.gz SHA256SUMS --title "Roundtable $GITHUB_REF_NAME" --generate-notes --verify-tag
+          sha256sum *.gz *.tgz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" *.gz *.tgz SHA256SUMS --title "Roundtable $GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}

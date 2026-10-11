@@ -2,6 +2,7 @@ use crate::state::{Session, State, Usage, now};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -183,7 +184,24 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
                 _ => {}
             },
             "response_item" => {
-                // User-visible messages come from event_msg; never copy reasoning items.
+                // Newer Codex versions persist visible messages only as response items.
+                // Never collect developer/system messages or reasoning records.
+                if p["type"] == "message" && p["channel"] != "analysis" {
+                    let kind = match p["role"].as_str() {
+                        Some("user") => Some("prompt"),
+                        Some("assistant") => Some("response"),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        let text = text_content(&p["content"]);
+                        if !text.is_empty() {
+                            if kind == "prompt" {
+                                session.state = "working".into();
+                            }
+                            event = Some((kind, text));
+                        }
+                    }
+                }
                 if p["type"] == "function_call" || p["type"] == "custom_tool_call" {
                     event = Some((
                         "tool",
@@ -241,6 +259,26 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
     }
     .into();
     if let Some((kind, text)) = event {
+        if session.provider == "codex" && matches!(kind, "prompt" | "response") {
+            // Some versions emit both representations. Pair them without retaining
+            // unshared text, while preserving repeated messages within one format.
+            let source = value["type"].as_str().unwrap_or("");
+            let other = if source == "event_msg" {
+                "response_item"
+            } else {
+                "event_msg"
+            };
+            let hash = format!(
+                "{:x}",
+                Sha256::digest(format!("{:?}:{text}", session.turn_id))
+            );
+            let key = format!("visible-message:{}:{kind}", session.id);
+            if state.get(&key)?.as_deref() == Some(&format!("{other}:{hash}")) {
+                state.set(&key, "")?;
+                return Ok(());
+            }
+            state.set(&key, &format!("{source}:{hash}"))?;
+        }
         let mut value = json!({"kind":kind,"session_id":session.id,"session":session});
         if session.collection == "content" {
             value["text"] = json!(text);
@@ -474,6 +512,50 @@ pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
 mod tests {
     use super::*;
     #[test]
+    fn codex_visible_message_formats_deduplicate_without_collecting_reasoning() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[fs::canonicalize(tmp.path())?],"remote_control":false})
+                .to_string(),
+        )?;
+        let mut session = Session::new(
+            "codex",
+            "formats",
+            fs::canonicalize(tmp.path())?.to_str().unwrap(),
+            "transcript",
+        );
+        let prompt = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"visible prompt"}]}});
+        let legacy = json!({"type":"event_msg","payload":{"type":"user_message","message":"visible prompt"}});
+        parse(&state, &mut session, &prompt)?;
+        parse(&state, &mut session, &legacy)?;
+        parse(&state, &mut session, &legacy)?;
+        parse(&state, &mut session, &prompt)?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"text","text":"private reasoning"}]}}),
+        )?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"private instructions"}]}}),
+        )?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible answer"}]}}),
+        )?;
+        let events = state.events(&session.id, 0)?;
+        let rows = events["events"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["text"], "visible prompt");
+        assert_eq!(rows[1]["text"], "visible prompt");
+        assert_eq!(rows[2]["text"], "visible answer");
+        Ok(())
+    }
+    #[test]
     fn partial_records_and_cumulative_usage_are_not_counted_twice() -> Result<()> {
         use std::io::Write;
         let tmp = tempfile::tempdir()?;
@@ -501,7 +583,8 @@ mod tests {
         assert!(!state.session("codex:sample")?.live);
         state.set(
             "policy",
-            &json!({"content_roots":[fs::canonicalize("/tmp")?],"remote_control":false}).to_string(),
+            &json!({"content_roots":[fs::canonicalize("/tmp")?],"remote_control":false})
+                .to_string(),
         )?;
         tail(&state, &path, "codex", &[])?;
         assert_eq!(
