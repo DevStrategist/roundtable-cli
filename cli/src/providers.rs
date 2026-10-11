@@ -113,10 +113,14 @@ impl RpcTransport {
         match self {
             Self::Process(process) => process.send(value),
             Self::Socket(socket) => {
-                socket.get_mut().set_nonblocking(false)?;
                 socket
                     .get_mut()
-                    .set_write_timeout(Some(Duration::from_secs(3)))?;
+                    .set_nonblocking(false)
+                    .context("Set RPC write mode")?;
+                socket
+                    .get_mut()
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .context("Set RPC write timeout")?;
                 socket.send(tungstenite::Message::Text(value.to_string().into()))?;
                 Ok(())
             }
@@ -133,11 +137,15 @@ impl RpcTransport {
                 None => Ok(process.output.try_recv().ok()),
             },
             Self::Socket(socket) => {
-                socket.get_mut().set_nonblocking(timeout.is_none())?;
+                socket
+                    .get_mut()
+                    .set_nonblocking(timeout.is_none())
+                    .context("Set RPC read mode")?;
                 if let Some(wait) = timeout {
                     socket
                         .get_mut()
-                        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+                        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+                        .context("Set RPC read timeout")?;
                 }
                 match socket.read() {
                     Ok(tungstenite::Message::Text(text)) => Ok(Some(serde_json::from_str(&text)?)),
@@ -180,22 +188,27 @@ impl Rpc {
         Self::initialize(RpcTransport::Process(JsonProcess::spawn(command)?))
     }
     fn shared(path: &Path) -> Result<Self> {
-        let meta = std::fs::symlink_metadata(path)?;
+        let meta = std::fs::symlink_metadata(path).context("Inspect shared socket")?;
         if !meta.file_type().is_socket()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.mode() & 0o022 != 0
         {
             bail!("Shared Codex socket must be owned by this user and not writable by others");
         }
-        let stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let stream = UnixStream::connect(path).context("Connect shared socket")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .context("Set shared read timeout")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .context("Set shared write timeout")?;
         let config = tungstenite::protocol::WebSocketConfig::default()
             .max_message_size(Some(4_000_000))
             .max_frame_size(Some(4_000_000));
         let (socket, _) =
-            tungstenite::client::client_with_config("ws://localhost/", stream, Some(config))?;
-        Self::initialize(RpcTransport::Socket(Box::new(socket)))
+            tungstenite::client::client_with_config("ws://localhost/", stream, Some(config))
+                .context("Shared WebSocket handshake")?;
+        Self::initialize(RpcTransport::Socket(Box::new(socket))).context("Initialize shared RPC")
     }
     fn initialize(transport: RpcTransport) -> Result<Self> {
         let mut rpc = Self {
@@ -771,12 +784,15 @@ mod tests {
     #[test]
     fn shared_daemon_uses_websocket_frames_and_preserves_notifications() -> Result<()> {
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-        let tmp = tempfile::tempdir()?;
+        let tmp = tempfile::tempdir_in("/tmp")?;
         let path = tmp.path().join("control.sock");
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))?;
+        let listener = UnixListener::bind(&path).context("Bind test socket")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+            .context("Make test socket shared")?;
         assert!(Rpc::shared(&path).is_err());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("Make test socket private")?;
+        let (done, finish) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             stream
@@ -813,6 +829,7 @@ mod tests {
                         .into(),
                 ))
                 .unwrap();
+            finish.recv_timeout(Duration::from_secs(3)).unwrap();
         });
         let mut rpc = Rpc::shared(&path)?;
         assert_eq!(
@@ -820,6 +837,7 @@ mod tests {
             "existing"
         );
         assert_eq!(rpc.drain()[0]["method"], "turn/started");
+        done.send(())?;
         server.join().unwrap();
         Ok(())
     }
