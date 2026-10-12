@@ -5,7 +5,7 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DevStrategist/roundtable-cli.git",
+    "url": "git+https://github.com/roundtable-bot/roundtable-cli.git",
     "directory": "cli/npm"
   },
   "type": "module",

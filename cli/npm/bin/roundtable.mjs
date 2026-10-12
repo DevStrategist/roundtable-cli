@@ -26,7 +26,7 @@ try { binary = require.resolve(`${name}/bin/roundtable`); }
 catch {
   binary = fileURLToPath(new URL("./native/roundtable", import.meta.url));
   if (!existsSync(binary)) {
-    console.error("Missing native binary. Reinstall from github:DevStrategist/roundtable-cli with install scripts enabled, or download a native GitHub Release.");
+    console.error("Missing native binary. Reinstall using the npm command at https://roundtable.bot/docs/cli, or download a native GitHub Release.");
     process.exit(1);
   }
 }

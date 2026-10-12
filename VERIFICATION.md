@@ -20,7 +20,7 @@ Claude Code 2.1.296. Live hosts were macOS ARM64 and Ubuntu Linux x64.
 
 The release workflow builds and tests all four native targets: macOS ARM64/x64
 and Linux ARM64/x64. Intel macOS and ARM64 Linux have CI coverage, not live cloud
-account acceptance. [Release build](https://github.com/DevStrategist/roundtable-cli/actions/runs/38106885278).
+account acceptance. [Release build](https://github.com/roundtable-bot/roundtable-cli/actions/runs/38106885278).
 
 The Rust tests cover transcript parsing and deduplication, usage accumulation,
 durable buffering and overflow gaps, credential storage, service definitions,

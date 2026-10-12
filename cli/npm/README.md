@@ -6,7 +6,8 @@ Install the npm tarball from the public GitHub release. No npm registry account 
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.8/roundtable-cli-0.2.8.tgz
+roundtable_package="https://github.com/roundtable-bot/roundtable-cli/releases/download/v0.2.8/roundtable-cli-0.2.8.tgz"
+npm install -g --allow-remote=root --allow-scripts="$roundtable_package" "$roundtable_package"
 roundtable login
 roundtable setup
 ```
@@ -82,11 +83,11 @@ requires glibc 2.35+, Linux arm64 requires 2.39+. Musl/Alpine is not packaged. T
 cargo install --path cli --locked
 ```
 
-Download native binaries without Node from [GitHub Releases](https://github.com/DevStrategist/roundtable-cli/releases).
+Download native binaries without Node from [GitHub Releases](https://github.com/roundtable-bot/roundtable-cli/releases).
 All four binaries and SHA256SUMS are built by the release workflow. The source is public;
 no open-source license grant has been added (package license: UNLICENSED).
 
 Runtime and control require a matching Roundtable server. Supported external sessions expose
 capabilities individually; ordinary existing Claude terminals remain observation-only.
 
-[Verified flows and platform limits](https://github.com/DevStrategist/roundtable-cli/blob/main/VERIFICATION.md).
+[Verified flows and platform limits](https://github.com/roundtable-bot/roundtable-cli/blob/main/VERIFICATION.md).

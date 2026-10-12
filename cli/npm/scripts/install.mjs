@@ -21,7 +21,7 @@ async function download(url, limit) {
 export async function install({version, baseUrl, destination, platform = process.platform, arch = process.arch}) {
   const target = targets[`${platform}-${arch}`];
   if (!target) throw new Error(`Unsupported platform ${platform}/${arch}`);
-  const base = baseUrl || `https://github.com/DevStrategist/roundtable-cli/releases/download/v${version}/`;
+  const base = baseUrl || `https://github.com/roundtable-bot/roundtable-cli/releases/download/v${version}/`;
   const asset = `roundtable-${target}.gz`;
   const sums = (await download(new URL("SHA256SUMS", base), 16384)).toString("utf8");
   const expected = sums.split(/\r?\n/).map(line => line.trim().split(/\s+/)).find(parts => parts[1] === asset)?.[0];
