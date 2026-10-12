@@ -45,6 +45,14 @@ pub fn request(root: &Path, value: &Value) -> Result<Value> {
 }
 
 fn inventory(state: &State) -> Result<()> {
+    // Keep one heartbeat behind backfill without accumulating snapshots while offline.
+    if state.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE json_extract(data,'$.kind')='inventory')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
     let sessions: Vec<_> = state
         .sessions()?
         .into_iter()
@@ -64,7 +72,7 @@ fn client() -> Result<Client> {
     Ok(Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(60))
         .user_agent(concat!("roundtable-cli/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
@@ -113,7 +121,7 @@ fn sync_once(state: &State, config: &Path, server: &Url, client: &Client) -> Res
     let status = response.status();
     if !status.is_success() {
         state.set("connection", &format!("server HTTP {}", status.as_u16()))?;
-        bail!("Sync rejected");
+        bail!("Server HTTP {}", status.as_u16());
     }
     let data: Value = response.json()?;
     let ack = data["ack"]
@@ -124,6 +132,7 @@ fn sync_once(state: &State, config: &Path, server: &Url, client: &Client) -> Res
         bail!("Server acknowledgement exceeds transmitted events");
     }
     state.ack(ack)?;
+    state.set("last_ack", &ack.to_string())?;
     state.set("connection", "online")?;
     state.set("last_sync", &now().to_string())?;
     for command in data["uncertain"].as_array().into_iter().flatten() {
@@ -344,14 +353,14 @@ pub fn run(root: PathBuf, config: PathBuf, server: Url) -> Result<()> {
         let client = client()?;
         let mut failures = 0;
         while sync_running.load(Ordering::SeqCst) {
-            if sync_once(&state, &config, &server, &client).is_err() {
+            if let Err(error) = sync_once(&state, &config, &server, &client) {
                 failures = (failures + 1).min(5);
-                state.set("connection", "offline; retrying")?;
+                state.set("connection", &format!("offline; retrying: {error}"))?;
             } else {
                 failures = 0;
             }
             let delay = if failures == 0 {
-                20
+                if state.batch()?.is_empty() { 20 } else { 1 }
             } else {
                 (20u64 << failures).min(300) + (std::process::id() as u64 % 17)
             };
@@ -424,6 +433,100 @@ fn read_request(stream: &mut UnixStream) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backfill_does_not_starve_inventory_or_accumulate_offline_snapshots() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        for _ in 0..200 {
+            state.event(json!({"kind":"status"}))?;
+        }
+        assert!(state.backlogged()?);
+        inventory(&state)?;
+        inventory(&state)?;
+        assert_eq!(
+            state.db.query_row(
+                "SELECT count(*) FROM outbox WHERE json_extract(data,'$.kind')='inventory'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        state.ack(201)?;
+        inventory(&state)?;
+        assert_eq!(state.batch()?[0]["kind"], "inventory");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_upload_is_replayed_after_restart_and_only_acknowledged_events_are_removed()
+    -> Result<()> {
+        use std::net::TcpListener;
+        let tmp = tempfile::tempdir()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+        let config = tmp.path().join("config");
+        let store = Store::open(config.clone(), url.as_str())?;
+        store.save(
+            crate::credentials::Credential {
+                device_id: "test-device".into(),
+                account_id: "test-account".into(),
+                server: url.to_string(),
+                access_token: None,
+            },
+            "test-only-token",
+            true,
+        )?;
+        drop(store);
+        let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+            let mut requests = vec![];
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse()?;
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body)?;
+                requests.push(serde_json::from_slice(&body)?);
+                if status == "200 OK" {
+                    // Large inventories on the real server can take longer than eight seconds.
+                    std::thread::sleep(Duration::from_secs(9));
+                }
+                let response = "{\"ack\":1,\"commands\":[],\"uncertain\":[]}";
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )?;
+            }
+            Ok(requests)
+        });
+        let root = tmp.path().join("state");
+        let state = State::open(root.clone())?;
+        state.set("device_id", "test-device")?;
+        state.event(json!({"kind":"status","text":"retained event"}))?;
+        assert!(sync_once(&state, &config, &url, &client()?).is_err());
+        assert_eq!(state.batch()?[0]["seq"], 1);
+        drop(state);
+        let state = State::open(root)?;
+        sync_once(&state, &config, &url, &client()?)?;
+        assert!(state.batch()?.is_empty());
+        assert_eq!(state.get("last_ack")?.as_deref(), Some("1"));
+        let requests = server.join().unwrap()?;
+        assert_eq!(requests[0]["events"], requests[1]["events"]);
+        assert_eq!(requests[0]["events"][0]["text"], "retained event");
+        Ok(())
+    }
+
     #[test]
     fn local_socket_accepts_delayed_fragmented_requests() -> Result<()> {
         let dir = tempfile::tempdir_in("/tmp")?;

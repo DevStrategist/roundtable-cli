@@ -6,7 +6,7 @@ Install the npm tarball from the public GitHub release. No npm registry account 
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.7/roundtable-cli-0.2.7.tgz
+npm install -g --allow-scripts=@roundtable/cli https://github.com/DevStrategist/roundtable-cli/releases/download/v0.2.8/roundtable-cli-0.2.8.tgz
 roundtable login
 roundtable setup
 ```
@@ -61,8 +61,16 @@ processes. Existing external terminal sessions are unaffected. Stop deliberately
 an upgraded service binary with `roundtable service install`.
 
 Telemetry syncs every two seconds, with five-second inventory reconciliation and bounded retry
-backoff. Offline activity is buffered locally. Overflow is reported as a coverage gap. Usage fields
+backoff. Pending uploads survive restarts and are retained until acknowledged. Transcript reading
+pauses when uploads fall behind and resumes from its saved position as the queue drains.
+Open sessions take priority over historical backfill, and session status continues during catch-up.
+Keep provider transcripts until the backlog clears. Observed transcript collection includes
+visible prompts, replies, tool inputs (including edits), and tool results.
+Deleted worktrees under an enabled root remain covered; use `monitor --metadata-only` to revoke collection.
+Long text is uploaded in consecutive chunks; Claude subagents have separate histories.
+Provider records larger than 16 MB are reported as coverage gaps. Usage fields
 are cumulative provider reports; unavailable fields are null. No token-price estimate is invented.
+Server activity history retains up to seven days and about 20,000 events per machine.
 Interrupting managed Claude currently ends its process; start another session to continue.
 Claude input totals include uncached and cached tokens; cached input is a subset of input.
 The dashboard shows stale/offline data explicitly and excludes it from current session counts.

@@ -87,8 +87,28 @@ pub struct Policy {
 
 impl Policy {
     pub fn content(&self, project: &str) -> bool {
-        fs::canonicalize(project)
-            .is_ok_and(|path| self.content_roots.iter().any(|root| path.starts_with(root)))
+        let project = Path::new(project);
+        for ancestor in project.ancestors() {
+            match fs::canonicalize(ancestor) {
+                Ok(base) => {
+                    let path = base.join(project.strip_prefix(ancestor).unwrap());
+                    return self.content_roots.iter().any(|root| path.starts_with(root));
+                }
+                Err(error) => {
+                    // Deleted worktrees retain their scope; unresolved symlinks and traversal do not.
+                    if error.kind() != std::io::ErrorKind::NotFound
+                        || !project.is_absolute()
+                        || project
+                            .components()
+                            .any(|part| part == std::path::Component::ParentDir)
+                        || fs::symlink_metadata(ancestor).is_ok_and(|m| m.file_type().is_symlink())
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -178,26 +198,34 @@ impl State {
             None
         };
         value["at"] = json!(now());
-        // Bounded content, never raw provider envelopes or internal reasoning.
-        if let Some(text) = value["text"].as_str() {
-            value["text"] = json!(text.chars().take(16000).collect::<String>());
-        }
-        self.db
-            .execute("INSERT INTO events(data) VALUES ('{}')", [])?;
-        let seq = self.db.last_insert_rowid();
-        value["seq"] = json!(seq);
-        let data = serde_json::to_string(&value)?;
-        let mut local = value.clone();
-        if let Some(object) = local.as_object_mut() {
-            object.remove("sessions");
-            object.remove("session");
-        }
-        self.db.execute(
-            "UPDATE events SET data=? WHERE seq=?",
-            params![serde_json::to_string(&local)?, seq],
-        )?;
-        self.db
-            .execute("INSERT INTO outbox VALUES (?,?)", params![seq, data])?;
+        // Bound each wire event without losing the remainder of visible output.
+        let text = value["text"].as_str().map(str::to_owned);
+        let mut remaining = text.as_deref().unwrap_or("").chars().peekable();
+        let seq = loop {
+            if text.is_some() {
+                value["text"] = json!(remaining.by_ref().take(16000).collect::<String>());
+            }
+            self.db
+                .execute("INSERT INTO events(data) VALUES ('{}')", [])?;
+            let seq = self.db.last_insert_rowid();
+            value["seq"] = json!(seq);
+            let data = serde_json::to_string(&value)?;
+            let mut local = value.clone();
+            if let Some(object) = local.as_object_mut() {
+                object.remove("sessions");
+                object.remove("session");
+            }
+            self.db.execute(
+                "UPDATE events SET data=? WHERE seq=?",
+                params![serde_json::to_string(&local)?, seq],
+            )?;
+            self.db
+                .execute("INSERT INTO outbox VALUES (?,?)", params![seq, data])?;
+            if remaining.peek().is_none() {
+                break seq;
+            }
+            value["append"] = json!(true);
+        };
         if let Some(tx) = transaction {
             tx.commit()?;
         }
@@ -219,6 +247,13 @@ impl State {
         }
         Ok(items)
     }
+    pub fn backlogged(&self) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT count(*)>=200 FROM (SELECT 1 FROM outbox LIMIT 200)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
     pub fn ack(&self, seq: i64) -> Result<()> {
         self.db.execute("DELETE FROM outbox WHERE seq<=?", [seq])?;
         Ok(())
@@ -234,25 +269,16 @@ impl State {
         )
     }
     pub fn prune(&self) -> Result<()> {
-        let transaction = self.db.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let max: i64 = self
             .db
             .query_row("SELECT coalesce(max(seq),0) FROM events", [], |r| r.get(0))?;
         self.db
             .execute("DELETE FROM events WHERE seq<?", [max - 10000])?;
         self.db.execute("DELETE FROM events WHERE seq < coalesce((SELECT min(seq) FROM (SELECT seq,sum(length(data)) OVER (ORDER BY seq DESC) AS bytes FROM events) WHERE bytes<=33554432),?)",[max])?;
-        let (count, bytes): (i64, i64) = self.db.query_row(
-            "SELECT count(*),coalesce(sum(length(data)),0) FROM outbox",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if count > 10000 || bytes > 32 * 1024 * 1024 {
-            let first: i64 = self
-                .db
-                .query_row("SELECT min(seq) FROM outbox", [], |r| r.get(0))?;
-            self.db.execute("DELETE FROM outbox", [])?;
-            self.event(json!({"kind":"gap","dropped_from":first,"dropped_to":max}))?;
-        }
         transaction.commit()?;
         Ok(())
     }
@@ -260,6 +286,10 @@ impl State {
         let policy = self.policy()?;
         for mut session in self.sessions()? {
             if !policy.content(&session.project) {
+                self.db.execute(
+                    "DELETE FROM settings WHERE key=?",
+                    [format!("transcript-content:{}", session.id)],
+                )?;
                 session.collection = "metadata".into();
                 self.save_session(&session)?;
                 for table in ["events", "outbox"] {
@@ -299,7 +329,28 @@ impl State {
 mod tests {
     use super::*;
     #[test]
-    fn overflowing_outbox_reports_the_exact_lost_sequence_range() -> Result<()> {
+    fn deleted_workspaces_remain_scoped_without_following_escaping_symlinks() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let allowed = fs::canonicalize(tmp.path())?.join("allowed");
+        let outside = fs::canonicalize(tmp.path())?.join("outside");
+        fs::create_dir(&allowed)?;
+        fs::create_dir(&outside)?;
+        let policy = Policy {
+            content_roots: vec![allowed.clone()],
+            remote_control: false,
+        };
+        assert!(policy.content(allowed.join("removed/project").to_str().unwrap()));
+        assert!(!policy.content(outside.join("removed/project").to_str().unwrap()));
+        assert!(!policy.content(allowed.join("missing/../../outside").to_str().unwrap()));
+        std::os::unix::fs::symlink(&outside, allowed.join("escape"))?;
+        assert!(!policy.content(allowed.join("escape/missing").to_str().unwrap()));
+        std::os::unix::fs::symlink(outside.join("missing"), allowed.join("dangling"))?;
+        assert!(!policy.content(allowed.join("dangling/project").to_str().unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_local_history_never_discards_unacknowledged_events() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let state = State::open(tmp.path().join("state"))?;
         let tx = state.db.unchecked_transaction()?;
@@ -309,14 +360,18 @@ mod tests {
         tx.commit()?;
         state.prune()?;
         let batch = state.batch()?;
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0]["kind"], "gap");
-        assert_eq!(batch[0]["dropped_from"], 1);
-        assert_eq!(batch[0]["dropped_to"], 10001);
-        assert_eq!(batch[0]["seq"], 10002);
+        assert_eq!(batch.len(), 100);
+        assert_eq!(batch[0]["kind"], "status");
+        assert_eq!(batch[0]["seq"], 1);
+        assert_eq!(
+            state
+                .db
+                .query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))?,
+            10001
+        );
         state.event(json!({"kind":"status"}))?;
-        state.ack(10002)?;
-        assert_eq!(state.batch()?[0]["seq"], 10003);
+        state.ack(10001)?;
+        assert_eq!(state.batch()?[0]["seq"], 10002);
         Ok(())
     }
     #[test]

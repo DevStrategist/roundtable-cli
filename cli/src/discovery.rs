@@ -124,7 +124,7 @@ pub fn processes(system: &mut System) -> Vec<Process> {
 
 pub fn text_content(value: &Value) -> String {
     if let Some(s) = value.as_str() {
-        return s.chars().take(16000).collect();
+        return s.to_owned();
     }
     value
         .as_array()
@@ -136,15 +136,13 @@ pub fn text_content(value: &Value) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
-                .chars()
-                .take(16000)
-                .collect()
         })
         .unwrap_or_default()
 }
 
 pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> {
     let mut event: Option<(&str, String)> = None;
+    let mut events = vec![];
     if session.provider == "codex" {
         let p = &value["payload"];
         match value["type"].as_str().unwrap_or("") {
@@ -168,10 +166,12 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
                 "task_started" => {
                     session.state = "working".into();
                     session.turn_id = p["turn_id"].as_str().map(str::to_owned);
+                    event = Some(("status", "Turn started".into()));
                 }
                 "task_complete" | "task_completed" | "turn_aborted" => {
                     session.state = "idle".into();
                     session.turn_id = None;
+                    event = Some(("status", p["type"].as_str().unwrap().replace('_', " ")));
                 }
                 "token_count" => {
                     let u = &p["info"]["total_token_usage"];
@@ -205,11 +205,30 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
                 if p["type"] == "function_call" || p["type"] == "custom_tool_call" {
                     event = Some((
                         "tool",
-                        format!("Tool: {}", p["name"].as_str().unwrap_or("unknown")),
+                        format!(
+                            "Tool: {}\n{}",
+                            p["name"].as_str().unwrap_or("unknown"),
+                            p["arguments"]
+                                .as_str()
+                                .or_else(|| p["input"].as_str())
+                                .unwrap_or("")
+                        ),
                     ));
                 }
                 if p["type"] == "function_call_output" || p["type"] == "custom_tool_call_output" {
                     event = Some(("tool", text_content(&p["output"])));
+                }
+                match p["type"].as_str() {
+                    Some("web_search_call") => {
+                        event = Some(("tool", format!("Web search\n{}", p["action"])))
+                    }
+                    Some("tool_search_call") => {
+                        event = Some(("tool", format!("Tool search\n{}", p["arguments"])))
+                    }
+                    Some("tool_search_output") => {
+                        event = Some(("tool", format!("Tool search results\n{}", p["tools"])))
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -218,20 +237,53 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
         if let Some(cwd) = value["cwd"].as_str() {
             session.project = cwd.into();
         }
-        match value["type"].as_str().unwrap_or("") {
-            "user" => {
-                let text = text_content(&value["message"]["content"]);
-                if !text.is_empty() {
-                    session.state = "working".into();
-                    event = Some(("prompt", text));
+        if matches!(value["type"].as_str(), Some("user" | "assistant")) {
+            let kind = if value["type"] == "user" {
+                "prompt"
+            } else {
+                "response"
+            };
+            let content = &value["message"]["content"];
+            if let Some(text) = content.as_str() {
+                events.push((kind, text.to_owned()));
+            }
+            for block in content.as_array().into_iter().flatten() {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        events.push((kind, block["text"].as_str().unwrap_or("").to_owned()))
+                    }
+                    Some("tool_use") => events.push((
+                        "tool",
+                        format!(
+                            "Tool: {} [{}]\n{}",
+                            block["name"].as_str().unwrap_or("unknown"),
+                            block["id"].as_str().unwrap_or(""),
+                            block["input"]
+                        ),
+                    )),
+                    Some("tool_result") => events.push((
+                        "tool",
+                        format!(
+                            "Tool result [{}]{}\n{}",
+                            block["tool_use_id"].as_str().unwrap_or(""),
+                            if block["is_error"] == true {
+                                " (error)"
+                            } else {
+                                ""
+                            },
+                            text_content(&block["content"])
+                        ),
+                    )),
+                    _ => {}
                 }
+            }
+        }
+        match value["type"].as_str().unwrap_or("") {
+            "user" if events.iter().any(|(kind, _)| *kind == "prompt") => {
+                session.state = "working".into();
             }
             "assistant" => {
                 let m = &value["message"];
-                let text = text_content(&m["content"]);
-                if !text.is_empty() {
-                    event = Some(("response", text));
-                }
                 if m["stop_reason"] == "end_turn" {
                     session.state = "idle".into();
                     session.turn_id = None;
@@ -258,7 +310,8 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
         "metadata"
     }
     .into();
-    if let Some((kind, text)) = event {
+    events.extend(event);
+    for (kind, text) in events {
         if session.provider == "codex" && matches!(kind, "prompt" | "response") {
             // Some versions emit both representations. Pair them without retaining
             // unshared text, while preserving repeated messages within one format.
@@ -275,7 +328,7 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
             let key = format!("visible-message:{}:{kind}", session.id);
             if state.get(&key)?.as_deref() == Some(&format!("{other}:{hash}")) {
                 state.set(&key, "")?;
-                return Ok(());
+                continue;
             }
             state.set(&key, &format!("{source}:{hash}"))?;
         }
@@ -309,7 +362,20 @@ fn identify(path: &Path, provider: &str) -> Result<Option<Session>> {
                     v["cwd"].as_str()
                 }
                 .unwrap_or("");
-                return Ok(Some(Session::new(provider, id, project, "transcript")));
+                let mut session = Session::new(provider, id, project, "transcript");
+                if provider == "claude"
+                    && v["isSidechain"] == true
+                    && let Some(agent) = v["agentId"].as_str().filter(|s| valid_id(s))
+                {
+                    let child = format!("{id}:{agent}");
+                    if !valid_id(&child) {
+                        return Ok(None);
+                    }
+                    session.id = format!("claude:{child}");
+                    session.provider_session_id = child;
+                    session.parent_id = Some(format!("claude:{id}"));
+                }
+                return Ok(Some(session));
             }
         }
     }
@@ -317,21 +383,20 @@ fn identify(path: &Path, provider: &str) -> Result<Option<Session>> {
 }
 
 pub fn tail(state: &State, path: &Path, provider: &str, processes: &[Process]) -> Result<()> {
+    const MAX_RECORD: u64 = 16_000_000;
     let Some(mut session) = identify(path, provider)? else {
         return Ok(());
     };
     if let Ok(saved) = state.session(&session.id) {
         session = saved;
     }
-    if session.source == "managed"
-        || (session.source == "app-server"
-            && state.get(&format!("history:{}", session.id))?.as_deref() == Some("true"))
-    {
+    if session.source == "managed" {
         return Ok(());
     }
     let meta = fs::metadata(path)?;
     let inode = format!("{}:{}", meta.dev(), meta.ino());
     let key = path.to_string_lossy();
+    let content_key = format!("transcript-content:{}", session.id);
     let saved: Option<(String, u64)> = state
         .db
         .query_row(
@@ -345,28 +410,39 @@ pub fn tail(state: &State, path: &Path, provider: &str, processes: &[Process]) -
         .map(|(_, o)| o)
         .unwrap_or(0);
     // Opting a project into collection makes its existing visible transcript available.
-    if session.collection != "content" && state.policy()?.content(&session.project) {
+    if state.policy()?.content(&session.project)
+        && (session.collection != "content" || state.get(&content_key)?.as_deref() != Some(&inode))
+    {
         offset = 0;
     }
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(file);
-    let transaction = state.db.unchecked_transaction()?;
+    // Reserve the writer before reading queue pressure; sync acknowledges concurrently.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state.db, rusqlite::TransactionBehavior::Immediate)?;
     let begin = offset;
     loop {
+        // Leave unread records in the provider's durable transcript until uploads catch up.
+        if state.backlogged()? {
+            break;
+        }
         let mut line = Vec::new();
         let size = reader
             .by_ref()
-            .take(1_000_001)
+            .take(MAX_RECORD + 1)
             .read_until(b'\n', &mut line)?;
         if size == 0 {
             break;
         }
-        if !line.ends_with(b"\n") && size <= 1_000_000 {
+        if !line.ends_with(b"\n") && size as u64 <= MAX_RECORD {
             break;
         } // Partial writes retry from the same offset.
         offset += size as u64;
-        if size > 1_000_000 {
+        if size as u64 > MAX_RECORD {
+            if !line.ends_with(b"\n") {
+                offset += reader.skip_until(b'\n')? as u64;
+            }
             state.event(json!({"kind":"status","session_id":session.id,"text":"Coverage gap: oversized provider record"}))?;
         } else if session.source != "managed"
             && let Ok(value) = serde_json::from_slice::<Value>(&line)
@@ -395,8 +471,25 @@ pub fn tail(state: &State, path: &Path, provider: &str, processes: &[Process]) -
             session.state = "unknown".into();
         }
     }
-    session.observed_at = now();
+    if session.live {
+        session.observed_at = now();
+    } else if offset != begin {
+        session.observed_at = meta
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs_f64();
+    } else {
+        session.observed_at = session.observed_at.min(
+            meta.modified()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs_f64(),
+        );
+    }
     state.save_session(&session)?;
+    if offset > begin && session.collection == "content" {
+        state.set(&content_key, &inode)?;
+    }
+    state.set(&format!("transcript:{}", session.id), key.as_ref())?;
     state.db.execute("INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(path) DO UPDATE SET inode=excluded.inode,offset=excluded.offset",params![key,inode,offset as i64])?;
     transaction.commit()?;
     Ok(())
@@ -404,7 +497,17 @@ pub fn tail(state: &State, path: &Path, provider: &str, processes: &[Process]) -
 
 pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
     let processes = processes(system);
+    let mut live_paths: HashSet<_> = processes
+        .iter()
+        .flat_map(|p| p.files.iter().cloned())
+        .collect();
+    for session in state.sessions()?.iter().filter(|s| s.live) {
+        if let Some(path) = state.get(&format!("transcript:{}", session.id))? {
+            live_paths.insert(PathBuf::from(path));
+        }
+    }
     let mut ok = true;
+    let mut pending = vec![];
     for provider in ["codex", "claude"] {
         let root = home(provider).join(if provider == "codex" {
             "sessions"
@@ -436,20 +539,22 @@ pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
         files.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
         // Bound work per scan. Explicit open descriptors are always included, even for old sessions.
         let mut paths: HashSet<_> = files.into_iter().take(200).map(|(_, p)| p).collect();
-        for p in &processes {
-            if p.provider == provider {
-                paths.extend(
-                    p.files
-                        .iter()
-                        .filter(|path| path.starts_with(&root))
-                        .cloned(),
-                );
-            }
-        }
+        paths.extend(
+            live_paths
+                .iter()
+                .filter(|path| path.starts_with(&root))
+                .cloned(),
+        );
         for path in paths {
-            if tail(state, &path, provider, &processes).is_err() {
-                ok = false;
-            }
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            pending.push((live_paths.contains(&path), modified, path, provider));
+        }
+    }
+    // Open sessions, including idle ones, take precedence over historical backfill.
+    pending.sort_unstable_by_key(|(live, modified, _, _)| std::cmp::Reverse((*live, *modified)));
+    for (_, _, path, provider) in pending {
+        if tail(state, &path, provider, &processes).is_err() {
+            ok = false;
         }
     }
     // Claude's supported inventory maps interactive/background sessions without guessing by cwd.
@@ -511,6 +616,290 @@ pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_tool_record_is_not_discarded_by_the_transcript_reader() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let project = fs::canonicalize(tmp.path())?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[project],"remote_control":false}).to_string(),
+        )?;
+        let output = "x".repeat(1_050_001);
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"large","cwd":project}}),
+                json!({"type":"response_item","payload":{"type":"function_call_output","output":output}})
+            ),
+        )?;
+        tail(&state, &path, "codex", &[])?;
+        let events = state.events("codex:large", 0)?;
+        assert_eq!(
+            events["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["text"].as_str().unwrap_or(""))
+                .collect::<String>()
+                .len(),
+            output.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_builtin_tools_and_turn_boundaries_are_reported() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let project = fs::canonicalize(tmp.path())?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[project],"remote_control":false}).to_string(),
+        )?;
+        let mut session =
+            Session::new("codex", "builtins", project.to_str().unwrap(), "transcript");
+        for value in [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"type":"response_item","payload":{"type":"web_search_call","action":{"type":"search","query":"Rust documentation"},"internal_chat_message_metadata_passthrough":{"private":"do not collect"}}}),
+            json!({"type":"response_item","payload":{"type":"tool_search_call","arguments":{"query":"repository tools","limit":2}}}),
+            json!({"type":"response_item","payload":{"type":"tool_search_output","tools":[{"type":"function","name":"fetch_docs"}]}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
+        ] {
+            parse(&state, &mut session, &value)?;
+        }
+        let events = state.events(&session.id, 0)?;
+        let rows = events["events"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|v| v["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["status", "tool", "tool", "tool", "status"]
+        );
+        assert!(events.to_string().contains("Rust documentation"));
+        assert!(events.to_string().contains("fetch_docs"));
+        assert!(!events.to_string().contains("do not collect"));
+        assert_eq!(session.state, "idle");
+        Ok(())
+    }
+
+    #[test]
+    fn app_server_inventory_does_not_suppress_complete_transcripts() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let session = Session::new("codex", "external", "/tmp", "app-server");
+        state.save_session(&session)?;
+        state.set("history:codex:external", "true")?;
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"external\",\"cwd\":\"/tmp\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"input\":\"a real edit\"}}\n",
+        )?;
+        tail(&state, &path, "codex", &[])?;
+        assert_eq!(state.events(&session.id, 0)?["events"][0]["kind"], "tool");
+        state.set(
+            "policy",
+            &json!({"content_roots":[fs::canonicalize("/tmp")?],"remote_control":false})
+                .to_string(),
+        )?;
+        let mut advertised = state.session(&session.id)?;
+        advertised.collection = "content".into();
+        state.save_session(&advertised)?;
+        tail(&state, &path, "codex", &[])?;
+        assert_eq!(
+            state.events(&session.id, 0)?["events"][1]["text"],
+            "Tool: apply_patch\na real edit"
+        );
+        tail(&state, &path, "codex", &[])?;
+        assert_eq!(
+            state.events(&session.id, 0)?["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_subagents_keep_separate_session_histories() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        for agent in ["worker-a", "worker-b"] {
+            let path = tmp.path().join(format!("{agent}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"user","sessionId":"parent","agentId":agent,"isSidechain":true,"cwd":"/tmp","message":{"content":"hello"}})
+                ),
+            )?;
+            tail(&state, &path, "claude", &[])?;
+        }
+        let sessions = state.sessions()?;
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.parent_id.as_deref() == Some("claude:parent"))
+        );
+        assert_ne!(sessions[0].id, sessions[1].id);
+        Ok(())
+    }
+
+    #[test]
+    fn backlogged_transcripts_resume_from_the_durable_cursor() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("state");
+        let state = State::open(root.clone())?;
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"backlog\",\"cwd\":\"/tmp\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"retained prompt\"}}\n",
+        )?;
+        let tx = state.db.unchecked_transaction()?;
+        for _ in 0..1000 {
+            state.event(json!({"kind":"status"}))?;
+        }
+        tx.commit()?;
+        tail(&state, &path, "codex", &[])?;
+        assert!(
+            state.events("codex:backlog", 0)?["events"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        drop(state);
+        let state = State::open(root)?;
+        state.ack(1000)?;
+        tail(&state, &path, "codex", &[])?;
+        tail(&state, &path, "codex", &[])?;
+        assert_eq!(
+            state.events("codex:backlog", 0)?["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_historical_transcript_is_not_new_activity() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"old\",\"cwd\":\"/tmp\"}}\n",
+        )?;
+        tail(&state, &path, "codex", &[])?;
+        let mut session = state.session("codex:old")?;
+        session.observed_at = 123.;
+        state.save_session(&session)?;
+        tail(&state, &path, "codex", &[])?;
+        assert_eq!(state.session("codex:old")?.observed_at, 123.);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_tool_calls_and_results_preserve_visible_content() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let project = fs::canonicalize(tmp.path())?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[project],"remote_control":false}).to_string(),
+        )?;
+        let mut session = Session::new("claude", "tools", project.to_str().unwrap(), "transcript");
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"assistant","message":{"content":[
+                {"type":"thinking","thinking":"private reasoning"},
+                {"type":"text","text":"Checking the file"},
+                {"type":"tool_use","id":"call-1","name":"Edit","input":{"file_path":"app.py","old_string":"broken","new_string":"fixed"}}
+            ]}}),
+        )?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"File updated"}]}
+            ]}}),
+        )?;
+        let events = state.events(&session.id, 0)?;
+        let rows = events["events"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["kind"], "response");
+        assert_eq!(rows[1]["kind"], "tool");
+        assert!(rows[1]["text"].as_str().unwrap().contains("fixed"));
+        assert!(rows[2]["text"].as_str().unwrap().contains("File updated"));
+        assert!(!events.to_string().contains("private reasoning"));
+        state.set(
+            "policy",
+            &json!({"content_roots":[],"remote_control":false}).to_string(),
+        )?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"private-command"}}]}}),
+        )?;
+        assert!(
+            state.events(&session.id, 0)?["events"][3]
+                .get("text")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tool_arguments_and_long_output_are_complete() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let project = fs::canonicalize(tmp.path())?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[project],"remote_control":false}).to_string(),
+        )?;
+        let mut session = Session::new("codex", "tools", project.to_str().unwrap(), "transcript");
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}),
+        )?;
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Add File: app.py\n+print(42)"}}),
+        )?;
+        let output = "é".repeat(40001);
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"response_item","payload":{"type":"function_call_output","output":output}}),
+        )?;
+        let events = state.events(&session.id, 0)?;
+        let rows = events["events"].as_array().unwrap();
+        assert!(rows[0]["text"].as_str().unwrap().contains("cargo test"));
+        assert!(rows[1]["text"].as_str().unwrap().contains("+print(42)"));
+        assert_eq!(
+            rows[2..]
+                .iter()
+                .map(|v| v["text"].as_str().unwrap())
+                .collect::<String>(),
+            output
+        );
+        assert!(rows[3..].iter().all(|v| v["append"] == true));
+        assert!(
+            rows.iter()
+                .all(|v| v["text"].as_str().unwrap().chars().count() <= 16000)
+        );
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn discovers_claudes_linux_native_executable_name() -> Result<()> {

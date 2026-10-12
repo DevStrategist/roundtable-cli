@@ -1,5 +1,6 @@
 name: Native builds and release
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ['v*']

@@ -442,11 +442,18 @@ impl Providers {
                         }
                         .into();
                         // Read only. Never resume a thread owned by another client.
-                        let history = external_history(proxy, state, &mut s);
-                        state.set(
-                            &format!("history:{}", s.id),
-                            if history.is_ok() { "true" } else { "false" },
-                        )?;
+                        // A local transcript includes all turns and tool types, unlike the recent-turn API.
+                        if !state
+                            .get(&format!("transcript:{}", s.id))?
+                            .is_some_and(|path| Path::new(&path).is_file())
+                            && !state.backlogged()?
+                        {
+                            let history = external_history(proxy, state, &mut s);
+                            state.set(
+                                &format!("history:{}", s.id),
+                                if history.is_ok() { "true" } else { "false" },
+                            )?;
+                        }
                         state.save_session(&s)?;
                         loaded.push(s.id);
                     }
