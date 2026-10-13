@@ -146,6 +146,11 @@ pub fn parse(state: &State, session: &mut Session, value: &Value) -> Result<()> 
     if session.provider == "codex" {
         let p = &value["payload"];
         match value["type"].as_str().unwrap_or("") {
+            "turn_context" => {
+                if let Some(cwd) = p["cwd"].as_str() {
+                    session.project = cwd.into();
+                }
+            }
             "session_meta" => {
                 if let Some(cwd) = p["cwd"].as_str() {
                     session.project = cwd.into();
@@ -616,6 +621,45 @@ pub fn scan(state: &State, system: &mut System) -> Result<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_turn_context_updates_project_and_collection_before_messages() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state = State::open(tmp.path().join("state"))?;
+        let project = fs::canonicalize(tmp.path())?;
+        state.set(
+            "policy",
+            &json!({"content_roots":[project],"remote_control":false}).to_string(),
+        )?;
+        let worktree = project.join("worktree");
+        fs::create_dir(&worktree)?;
+        let mut session = Session::new("codex", "moves", "/unshared", "transcript");
+        let prompt = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"visible prompt"}]}});
+        for cwd in [&project, &worktree] {
+            parse(
+                &state,
+                &mut session,
+                &json!({"type":"turn_context","payload":{"cwd":cwd}}),
+            )?;
+            parse(&state, &mut session, &prompt)?;
+            assert_eq!(Path::new(&session.project), cwd);
+            assert_eq!(session.collection, "content");
+        }
+        parse(
+            &state,
+            &mut session,
+            &json!({"type":"turn_context","payload":{"cwd":"/unshared"}}),
+        )?;
+        parse(&state, &mut session, &prompt)?;
+        let events = state.events(&session.id, 0)?;
+        let rows = events["events"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["text"], "visible prompt");
+        assert_eq!(rows[1]["text"], "visible prompt");
+        assert!(rows[2].get("text").is_none());
+        assert_eq!(session.collection, "metadata");
+        Ok(())
+    }
+
     #[test]
     fn large_tool_record_is_not_discarded_by_the_transcript_reader() -> Result<()> {
         let tmp = tempfile::tempdir()?;

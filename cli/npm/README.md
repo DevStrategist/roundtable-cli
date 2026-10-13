@@ -6,7 +6,7 @@ Install the npm tarball from the public GitHub release. No npm registry account 
 binary; it does not build Rust or start background services. Node 20+ is required for npm.
 
 ```sh
-roundtable_package="https://github.com/roundtable-bot/roundtable-cli/releases/download/v0.2.8/roundtable-cli-0.2.8.tgz"
+roundtable_package="https://github.com/roundtable-bot/roundtable-cli/releases/download/v0.2.9/roundtable-cli-0.2.9.tgz"
 npm install -g --allow-remote=root --allow-scripts="$roundtable_package" "$roundtable_package"
 roundtable login
 roundtable setup
@@ -67,6 +67,7 @@ pauses when uploads fall behind and resumes from its saved position as the queue
 Open sessions take priority over historical backfill, and session status continues during catch-up.
 Keep provider transcripts until the backlog clears. Observed transcript collection includes
 visible prompts, replies, tool inputs (including edits), and tool results.
+Codex project paths and collection scope follow the working directory reported for each turn.
 Deleted worktrees under an enabled root remain covered; use `monitor --metadata-only` to revoke collection.
 Long text is uploaded in consecutive chunks; Claude subagents have separate histories.
 Provider records larger than 16 MB are reported as coverage gaps. Usage fields
